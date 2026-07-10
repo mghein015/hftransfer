@@ -1,0 +1,49 @@
+name: Run FastAPI for 6 Hours
+
+on:
+  workflow_dispatch: # Allows you to trigger this manually from the GitHub UI
+
+jobs:
+  run-app:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Check out repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-python: '3.10' # Matches standard FastAPI/Supabase setups
+        cache: 'pip'
+
+    - name: Install dependencies
+      run: |
+        pip install fastapi uvicorn httpx supabase huggingface_hub google-auth-oauthlib google-api-python-client requests py7zr rarfile
+        # Note: adjust/add any other dependencies if you have a requirements.txt file instead:
+        # pip install -r requirements.txt
+
+    - name: Start FastAPI server and Local Tunnel
+      env:
+        # Inject your required environment variables here
+        HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        HF_REPO_ID: ${{ secrets.HF_REPO_ID }}
+        SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+        SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
+        GDRIVE_OAUTH_CLIENT_ID: ${{ secrets.GDRIVE_OAUTH_CLIENT_ID }}
+        GDRIVE_OAUTH_CLIENT_SECRET: ${{ secrets.GDRIVE_OAUTH_CLIENT_SECRET }}
+      run: |
+        # 1. Start the FastAPI app in the background
+        python app.py &
+        
+        # 2. Wait a few seconds for Uvicorn to initialize
+        sleep 5
+        
+        # 3. Use npx to launch localtunnel without installing it globally
+        # This will expose port 7860 (the port defined in your app's entrypoint)
+        echo "=== YOUR PUBLIC FASTAPI URL WILL APPEAR BELOW ==="
+        npx localtunnel --port 7860 &
+        
+        # 4. Keep the runner alive for exactly 6 hours (21600 seconds)
+        sleep 21600
