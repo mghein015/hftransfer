@@ -19,7 +19,7 @@ jobs:
 
     - name: Install dependencies
       run: |
-        pip install fastapi uvicorn httpx supabase huggingface_hub google-auth-oauthlib google-api-python-client requests py7zr rarfile
+        pip install python-multipart fastapi uvicorn httpx supabase huggingface_hub google-auth-oauthlib google-api-python-client requests py7zr rarfile
         # Note: adjust/add any other dependencies if you have a requirements.txt file instead:
         # pip install -r requirements.txt
 
