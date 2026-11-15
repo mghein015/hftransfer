@@ -40,10 +40,11 @@ GDRIVE_OAUTH_REDIRECT_URI  = os.environ.get("GDRIVE_OAUTH_REDIRECT_URI", "http:/
 
 MAX_CONCURRENT_JOBS = 5
 GDRIVE_MAX_WORKERS  = 4
-CHUNK_1MB  = 1 << 20
-CHUNK_8MB  = 8 << 20
-CHUNK_50MB = 50 << 20
-BATCH_OPS  = 90
+CHUNK_1MB   = 1 << 20
+CHUNK_8MB   = 8 << 20
+CHUNK_16MB  = 16 << 20
+CHUNK_50MB  = 50 << 20
+BATCH_OPS   = 90
 
 sb_url, sb_key = os.environ.get("SUPABASE_URL"), os.environ.get("SUPABASE_SERVICE_KEY")
 supabase: Optional[Client] = create_client(sb_url, sb_key) if sb_url and sb_key else None
@@ -98,13 +99,7 @@ def _get_gdrive_service(
 ):
     """
     Build an authenticated Drive v3 service.
-
-    Auth priority:
-      1. oauth_refresh_token  — personal Google account (has real storage quota)
-      2. sa_json arg          — service account JSON string or file path
-      3. GDRIVE_SA_JSON env   — fallback service account
     """
-    # ── OAuth2 personal account ──────────────────────────────────────────────
     if oauth_refresh_token:
         cid = client_id or GDRIVE_OAUTH_CLIENT_ID
         csec = client_secret or GDRIVE_OAUTH_CLIENT_SECRET
@@ -124,7 +119,6 @@ def _get_gdrive_service(
         creds.refresh(GoogleAuthRequest())
         return gdrive_build("drive", "v3", credentials=creds, cache_discovery=False)
 
-    # ── Service account ──────────────────────────────────────────────────────
     raw = sa_json or GDRIVE_SA_JSON
     if not raw:
         raise ValueError(
@@ -183,7 +177,7 @@ def _gdrive_ensure_folder(service, name: str, parent_id: str) -> str:
     res = service.files().list(
         q=q, fields="files(id)", pageSize=1,
         supportsAllDrives=True, includeItemsFromAllDrives=True,
-    ).execute()
+    ).execute(num_retries=5)
     if res["files"]:
         return res["files"][0]["id"]
     meta = {
@@ -193,7 +187,7 @@ def _gdrive_ensure_folder(service, name: str, parent_id: str) -> str:
     }
     return service.files().create(
         body=meta, fields="id", supportsAllDrives=True,
-    ).execute()["id"]
+    ).execute(num_retries=5)["id"]
 
 
 def _gdrive_list_folder_files(service, parent_id: str) -> dict:
@@ -209,7 +203,7 @@ def _gdrive_list_folder_files(service, parent_id: str) -> dict:
             pageToken=page_token,
             supportsAllDrives=True,
             includeItemsFromAllDrives=True,
-        ).execute()
+        ).execute(num_retries=5)
         for f in res.get("files", []):
             existing[f["name"]] = f["id"]
         page_token = res.get("nextPageToken")
@@ -219,12 +213,11 @@ def _gdrive_list_folder_files(service, parent_id: str) -> dict:
 
 
 def _gdrive_file_exists(service, name: str, parent_id: str) -> Optional[str]:
-    """Return Drive file ID if a non-trashed file with this name exists in parent, else None."""
     q = f"name='{_gdrive_escape_q(name)}' and '{parent_id}' in parents and trashed=false"
     res = service.files().list(
         q=q, fields="files(id)", pageSize=1,
         supportsAllDrives=True, includeItemsFromAllDrives=True,
-    ).execute()
+    ).execute(num_retries=5)
     return res["files"][0]["id"] if res["files"] else None
 
 
@@ -266,12 +259,18 @@ def _gdrive_upload_file_resumable(
     overwrite: bool = False,
     existing_id: Optional[str] = None,
 ) -> str:
+    """
+    Upload one file using a single-stream resumable upload (chunksize=-1).
+    Using chunksize=-1 streams the entire file in one continuous HTTP PUT
+    instead of stopping every N megabytes for a 308 Resume Incomplete round-trip,
+    maximizing throughput on high-bandwidth servers like GitHub Actions.
+    """
     mime, _ = mimetypes.guess_type(local_path)
     mime = mime or "application/octet-stream"
 
     media = GDriveMediaFileUpload(
         local_path, mimetype=mime,
-        resumable=True, chunksize=CHUNK_8MB,
+        resumable=True, chunksize=-1,
     )
 
     if existing_id:
@@ -281,7 +280,7 @@ def _gdrive_upload_file_resumable(
                 media_body=media,
                 fields="id",
                 supportsAllDrives=True,
-            ).execute()
+            ).execute(num_retries=5)
             return file["id"]
         else:
             return existing_id
@@ -290,7 +289,7 @@ def _gdrive_upload_file_resumable(
     file = service.files().create(
         body=meta, media_body=media, fields="id",
         supportsAllDrives=True,
-    ).execute()
+    ).execute(num_retries=5)
     return file["id"]
 
 
@@ -595,11 +594,12 @@ class HFManager:
         return self._dst_fs
 
     def _retry_db(self, fn):
+        transient = ("ConnectionTerminated", "Server disconnected", "RemoteProtocolError", "Connection reset")
         for attempt in range(3):
             try:
                 return fn()
             except Exception as e:
-                if attempt == 2 or "ConnectionTerminated" not in str(e):
+                if attempt == 2 or not any(t in str(e) or t in type(e).__name__ for t in transient):
                     raise
                 time.sleep(1)
 
@@ -759,7 +759,7 @@ class HFManager:
                         local = os.path.join(tmp, f"dl_{os.path.basename(fp)}")
                         with self.src_fs.open(_hf_url("bucket", repo_id, fp), "rb") as f_in:
                             with open(local, "wb") as f_out:
-                                shutil.copyfileobj(f_in, f_out)
+                                shutil.copyfileobj(f_in, f_out, length=CHUNK_16MB)
                     else:
                         local = hf_hub_download(
                             repo_id=repo_id, filename=fp, repo_type=repo_type,
@@ -778,13 +778,12 @@ class HFManager:
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
-    # ─── GDRIVE TRANSFER (Parallel Option B: N files at a time) ──────────────
+    # ─── GDRIVE TRANSFER (Optimized Parallel Option B) ────────────────────────
 
     def transfer_to_gdrive_sync(self, job_id: Optional[str], req: "GDriveTransferRequest") -> dict:
         """
         Transfer HF repo/bucket → Google Drive with parallel workers while keeping
-        Option B disk-cleanup guarantees (each worker deletes its temp file
-        immediately after upload).
+        Option B disk-cleanup guarantees.
         """
         self._db(job_id, status="initializing", progress=2)
 
@@ -832,22 +831,50 @@ class HFManager:
         errors: List[dict] = []
         tmp_dir = tempfile.mkdtemp()
 
-        # Thread-safe caches, locks, and thread-local Drive clients
+        # Thread-safe caches, locks, and throttled DB state
         folder_cache = {}
         files_in_folder_cache = {}
         meta_lock = threading.Lock()
         stats_lock = threading.Lock()
         thread_local = threading.local()
 
+        cancel_state = {"cancelled": False, "last_check": 0.0}
+        last_db_update = [0.0]
+
+        def _check_cancelled_throttled():
+            if not supabase or not job_id:
+                return
+            if cancel_state["cancelled"]:
+                raise Exception("Job cancelled by user")
+            now = time.monotonic()
+            with stats_lock:
+                if cancel_state["cancelled"]:
+                    raise Exception("Job cancelled by user")
+                if now - cancel_state["last_check"] < 3.0:
+                    return
+                cancel_state["last_check"] = now
+            try:
+                self._cancelled(job_id)
+            except Exception as e:
+                if str(e) == "Job cancelled by user":
+                    with stats_lock:
+                        cancel_state["cancelled"] = True
+                raise
+
         def get_thread_service():
             if not hasattr(thread_local, "service"):
                 thread_local.service = _build_service()
             return thread_local.service
 
+        def get_thread_fs() -> HfFileSystem:
+            if not hasattr(thread_local, "fs"):
+                thread_local.fs = HfFileSystem(token=self.src_token, use_listings_cache=False)
+            return thread_local.fs
+
         def _process_one(file_info: dict):
             nonlocal transferred, skipped, skipped_existing, completed_count
             rel_path = file_info["path"]
-            self._cancelled(job_id)
+            _check_cancelled_throttled()
 
             srv = get_thread_service()
             local_path = None
@@ -873,18 +900,25 @@ class HFManager:
                         skipped_existing += 1
                         completed_count += 1
                         pct = 10 + int((completed_count / total) * 88)
+                        now = time.monotonic()
+                        should_update = (completed_count == total) or (now - last_db_update[0] >= 1.5)
+                        if should_update:
+                            last_db_update[0] = now
+                    if should_update:
                         self._db(
                             job_id, progress=pct, status="uploading",
                             error_message=f"[{completed_count}/{total}] {rel_path} (already on Drive, skipped)",
                         )
                     return
 
-                # ── Download single file ────────────────────────────────────
+                # ── Download single file (isolated per thread) ──────────────
                 if req.repo_type == "bucket":
+                    t_fs = get_thread_fs()
                     local_path = os.path.join(tmp_dir, f"_dl_{uuid.uuid4().hex[:8]}_{os.path.basename(rel_path)}")
-                    with self.src_fs.open(f"hf://buckets/{req.repo_id}/{rel_path}", "rb") as f_in:
+                    escaped_rel = _fs_escape(rel_path)
+                    with t_fs.open(f"hf://buckets/{req.repo_id}/{escaped_rel}", "rb") as f_in:
                         with open(local_path, "wb") as f_out:
-                            shutil.copyfileobj(f_in, f_out, length=CHUNK_8MB)
+                            shutil.copyfileobj(f_in, f_out, length=CHUNK_16MB)
                 else:
                     sub_tmp = os.path.join(tmp_dir, uuid.uuid4().hex[:8])
                     os.makedirs(sub_tmp, exist_ok=True)
@@ -902,7 +936,9 @@ class HFManager:
                         f"(expected at {local_path})"
                     )
 
-                # ── Upload to Drive (resumable 8MB chunks) ──────────────────
+                _check_cancelled_throttled()
+
+                # ── Upload to Drive (single continuous stream) ──────────────
                 new_id = _gdrive_upload_file_resumable(
                     srv, local_path, filename,
                     parent_id, overwrite=req.overwrite,
@@ -916,6 +952,12 @@ class HFManager:
                     transferred += 1
                     completed_count += 1
                     pct = 10 + int((completed_count / total) * 88)
+                    now = time.monotonic()
+                    should_update = (completed_count == total) or (now - last_db_update[0] >= 1.0)
+                    if should_update:
+                        last_db_update[0] = now
+
+                if should_update:
                     self._db(
                         job_id, progress=pct, status="uploading",
                         error_message=f"[{completed_count}/{total}] {rel_path}",
@@ -1048,7 +1090,7 @@ class HFManager:
                             try:
                                 with self.src_fs.open(src_url, "rb") as f_in:
                                     with open(local, "wb") as f_out:
-                                        shutil.copyfileobj(f_in, f_out, length=CHUNK_8MB)
+                                        shutil.copyfileobj(f_in, f_out, length=CHUNK_16MB)
                             except FileNotFoundError:
                                 raise Exception(f"Access denied or missing: {src_url}")
                             downloaded = local
@@ -1132,7 +1174,7 @@ class HFManager:
                     local = os.path.join(tmp, os.path.basename(f))
                     with self.src_fs.open(_hf_url(src_type, src_id, f), "rb") as f_in:
                         with open(local, "wb") as f_out:
-                            shutil.copyfileobj(f_in, f_out, length=CHUNK_8MB)
+                            shutil.copyfileobj(f_in, f_out, length=CHUNK_16MB)
                     dl = local
                 else:
                     dl = hf_hub_download(
